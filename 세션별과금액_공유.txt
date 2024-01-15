@@ -1,0 +1,382 @@
+--221208 변경 업데이트
+--수정점 1, session start battary Rate and end battary Rate 추가됨 
+--221113 변경 업데이트
+--수정점 1, (other stop의 경우, max값에서 min값으로 변경하여 other 값 여러번 뜰 때 첫 other stop timestamp로 계산되게함 ) 
+--수정점 2, (other stop이 여러번 나올 경우 0으로 처리)
+with fee_raw as (with session_raw as (SELECT 
+	sq2."spotSlotId", 
+	sq2."pmDeviceId", 
+	max(st_dt) as "historyStartAt", --도킹 시작 시점, max을 가져와서 가장 최근 On된 기록으로 계산함
+	min(fc_dt) as "fullChargedAt", --풀차지 시점 
+	--LAG(max(fc_dt)) OVER (ORDER BY rnk) as "prevFullChargedAt", -- 이전에 풀차지 된 시점 
+	min(other_dt) as "otherStopAt", --에러로 종료 시  
+	------------------------------------------------------------------------------------------------221113 수정점 1, (other stop의 경우, max값에서 min값으로 변경하여 other 값 여러번 뜰 때 첫 other stop timestamp로 계산되게함 ) 
+	min(end_dt) as "historyEndAt", --탈거 시작 시
+	min("timeStamp") as "timeStamp",
+	min(sq2."errCode") as "errCode",
+	min(sq2."errDescription") as "errDescription",
+	"rnk",
+	row_number () over (order by rnk),
+	min(on_batteryRate) as start_battery,
+	--case when sq2."errCode" is null then max(off_batteryRate) 
+	--when sq2."errCode" is not null then min(off_batteryRate) end as end_battery
+	max(off_batteryRate_session_end) as end_battery_session_end, -- 세션 종료 시 배터리 
+	max(off_batteryRate) as end_battery -- 탈거 시배터리양 
+	FROM (
+		SELECT *, 
+		(case when "historyEventType_1"='on' then "timeStamp" end) as st_dt,
+		(case when "historyEventType_1"='off' then "timeStamp" end) as end_dt,
+		(case when "historyEventType_1"='fullCharge' then "timeStamp" end) as fc_dt,
+		(case when "historyEventType_1"='other' then "timeStamp" end) as other_dt,
+		-------------------------------------------------------------------
+		(case when "historyEventType_1"='on' then "batteryRate" end) as on_batteryRate,
+		(case when "errCode" is not null and "historyEventType_1"='fullCharge' or "historyEventType_1"='other' then "batteryRate" end) as off_batteryRate_session_end,
+		(case when "errCode" is null and "historyEventType_1"='off' then "batteryRate" end) as off_batteryRate,
+		-------------------------------------------------------------------
+	 SUM(case when "historyEventType_1" ='on'
+	 /*("historyEventType_1"='off' and "prevType" = 'fullCharge')
+  	 	 or ("historyEventType_1" ='off' and "prevType" = 'on')
+     	 or ("historyEventType_1"='fullCharge' and "prevType" = 'on')
+     	 or ("historyEventType_1" ='off' and "prevType" = 'other')
+     	 or ("historyEventType_1" ='other' and "prevType" = 'on')
+     	 or ("historyEventType_1" ='other' and "prevType" = 'other')*/
+     	 ------------------------------------------------------------------------------------------------221113 수정점 2, other stop이 여러번 나올 경우 0으로 처리 
+		 THEN 1 ELSE 0 END) OVER (ORDER BY "spotSlotId", "pmDeviceId", "timeStamp") AS rnk --이전 타입이 무엇인지에 따라 해당 status가 세션의 시작인지, 다른 세션에서 종료된 건지를 따져서 등수를 매긴 것으로 DOCK ON 등 세션의 시작에 한해서 ROW만 Count 해서 SUM 한 값  
+			FROM (SELECT case when "historyEventType" = 'on' then 'on'
+				when "historyEventType" = 'off' then 'off'
+				when "historyEventType" = 'fullCharge' then 'fullCharge'
+				else 'other' end as "historyEventType_1",
+				ts.id,
+		--------------------------------------------------------------------------- other stop까지계산하기위해 [other = errorEnd, errorStart, rxModuleError]로 치환 	
+					ts."timeStamp", ts."errCode", ts."errDescription", ts."spotSlotId", ts."pmDeviceId", 
+					LAG(case when "historyEventType" = 'on' then 'on'
+				when "historyEventType" = 'off' then 'off'
+				when "historyEventType" = 'fullCharge' then 'fullCharge'
+				else 'other' end) OVER (ORDER BY ts."spotSlotId", ts."pmDeviceId", ts."timeStamp") AS "prevType",
+				"batteryRate"
+					-----LAG/LEAD 함수는 특정 집합 내에서 결과 건수의 변화 없이 해당 집합안에서 특정 컬럼의 이전 행의 값 혹은 다음 행의 값을 구합니다.
+					FROM "public"."SpotHistory" "ts" WHERE ( ts."historyEventType" IN ('fullCharge', 'on', 'off','errorEnd','errorStart','rxModuleError','fodError')) AND ( "ts"."deletedAt" IS NULL )) "sq1") "sq2"
+					GROUP BY rnk, sq2."pmDeviceId", sq2."spotSlotId" ORDER BY "timeStamp" desc),
+		-------------------------------------Session Raw 종료----------------------------------------
+					mid_fc_at as 
+						(select sr.*, fct."rank", fct."recent_fc_at", fct."charged_at", fct."charged"
+						from session_raw sr
+						left join (select *,
+									case when "charged_at" is not null then '1회성요금부과' end as charged --1회성 요금 부과 
+									from(select *, case when "aa" = '부과' then "timeStamp" 
+										when "recent_fc_at" not between ("timeStamp" - interval '2 day') and "timeStamp" then "timeStamp" end as charged_at
+										from(select *,
+											(lag ("timeStamp") over (partition by "pmDeviceId" order by "timeStamp")) as recent_fc_at,
+											case when rank = '1' then '부과' end as aa
+											from(select distinct "spotSlotId", "pmDeviceId", "timeStamp", "errCode", "historyEventType",
+												rank () over(partition by "pmDeviceId" order by "pmDeviceId", "timeStamp") 
+												FROM "public"."SpotHistory" "ts" 
+												WHERE ts."historyEventType" IN ('fullCharge') or ts."errCode" in ('01','03') -- 에러코드 1, 3과 이벤트 타입이 풀차지인 경우 
+												order by "pmDeviceId", "timeStamp") as rr
+											order by "pmDeviceId", "timeStamp") as rrr) as rrrr) as fct on sr."pmDeviceId" = fct."pmDeviceId" and sr."timeStamp" = fct."timeStamp"),
+		fee_calculate_raw as (select 
+				row_number as session_number,-- n 번째 세션인지 보여주는 컬럼 
+				rnk,
+				"spotSlotId", -- 스테이션 ID
+				"pmDeviceId", -- 어떤 PM인지 보여주는 ID
+				"historyStartAt", -- 도킹 시작 된 시간 (KST)
+				"historyEndAt", --일반적으로(앱 이용 또는 일반 PM기기 탈거) 도킹 해제 된 시간 (KST) 
+				"fullChargedAt", -- 완충 된 시각 (KST)
+				"charged_at", -- 이전에 풀차지 되었을 때의 시간 (KST)
+				"charged" as one_time_fee_charged,
+				"otherStopAt", -- 기타 오류 등으로 충전 종료 된 시각 (KST)
+				"errCode", -- 에러 시 에러 코드
+				"errDescription", -- 에러 시 에러 상세 설명값
+				 start_battery,
+				 end_battery,
+				 end_battery_session_end,
+				--------------- 과금 계산 영역 ---------------
+			date_trunc('minute', case when "historyStartAt" is not null and "fullChargedAt" is not null then ("fullChargedAt" - "historyStartAt") 
+   				 when "historyStartAt" is not null and "otherStopAt" is not null then ("otherStopAt"-"historyStartAt")
+   				 when "historyStartAt" is not null and "otherStopAt" is null then ("historyEndAt"-"historyStartAt") else null end) as charging_time -- 1분 미만 절사 후 금액
+				from mid_fc_at),
+						last_raw as (select *,
+							extract ('epoch' from ("charging_time"))/60 as charging_mins, -- 충전 된 시간(분)
+							case when ((extract ('epoch' from ("charging_time"))/60)*(4.5)) is null then 0 else ((extract ('epoch' from ("charging_time"))/60)*(4.5)) end as charging_amount, --(KRW)원화 기준 부과 된 충전 금액 
+							case when one_time_fee_charged = '1회성요금부과' then 50 
+							--when one_time_fee_charged is null and "errCode" = '01' then 50 
+							--when one_time_fee_charged is null and "errCode" = '03' then 50 
+							else 0 end as One_time_fee_amount, -- 1회성 요금 부과액  (PM 기기별 48시간마다 1회씩 부과)
+							------------------------------------------------------------
+							case when (((extract ('epoch' from ("charging_time"))/60)*(4.5))+(case when one_time_fee_charged = '1회성요금부과' then 50 
+							--when one_time_fee_charged is null and "errCode" = '01' then 50 
+							--when one_time_fee_charged is null and "errCode" = '03' then 50 
+							else 0 end)) is null then 0 else (((extract ('epoch' from ("charging_time"))/60)*(4.5))+(case when one_time_fee_charged = '1회성요금부과' then 50 
+							--when one_time_fee_charged is null and "errCode" = '01' then 50 
+							--when one_time_fee_charged is null and "errCode" = '03' then 50 -- 1회성 요금 FullchargeAt / 01 / 03 과금
+							else 0 end)) end as charged_amount_total --— 총 부과 금액 합계 
+								from fee_calculate_raw)
+							--—  errCode 
+							--— 01	Rx Stop 무선모듈 이상동작
+							--—	02	Tx Stop 스테이션 이상동작
+							--—	03	Battery Failure 배터리 이상동작
+							--—	04	FOD 
+							--—	99	기타 
+							--—	string	정의되지 않은 오류
+						--————————— 아래는 마지막 last_raw에 where절 조건 걸어주는 곳 ———— 
+							select *
+							from last_raw lr
+							where 
+								"historyStartAt" is not null
+							--charged_amount_total is not null and charged_amount_total != '0' -- 부과될 금액이 없거나 0원인 세션을 제외
+								--and "historyEndAt" between '2022-08-25' and '2022-08-31' 		 -- 탈거 또는 Other Stop 으로 충전 종료된 시각을 기준으로 날짜를 조정하는
+							/*쿼리의 구성
+								1. sq1 쿼리에서 조건에 해당하는 데이터만 불러옴
+								2. sq2 쿼리에서 조건에 따라 세션에 해당하는 번호 붙임
+									2.1 번호 붙이는 규칙	
+										2.1.1 - 생성된 row의 status 값과 바로 직전 찍힌 status값이 무엇인지에 따라, 세션의 종료에 해당하는 status인지, 세션의 시작에 해당되는 status인지 결정
+								3. 위에서 생성된 규칙에 따라 session_raw 테이블을 생성하였고, 이를 바탕으로 과금을 계산함
+									3.1 1회성 요금 과금 규칙
+										3.1.1 - 각 PM id별로 완충된 status(fullChargedAt)가 찍힌 시점을 timeStamp별로 줄세워 rank를 매김
+										3.1.2 - 해당 rank 중 1번 랭킹은 첫 번째 과금 부과 대상으로 선정하여 첫 과금 부과
+										3.1.3 - 나머지 완충 status row들에 대해서는 직전 충전 status가 찍힌 시간이 현재 row에 찍힌 완충 status 시간 -2일(48시간) 내 포함되지 않는 다면 과금 처리 */
+								),
+								---------pm사 기기랑 이름 연동하기 위한테이
+								pm_com_raw as (select pd.*,
+															pc."pmCompanyEnum",
+															pc."name"
+															--"description"
+															from "PmDevice" pd 
+															left join "PmCompany" pc on pd."pmCompanyId" = pc.id 
+															left join "SpotSlot" ss on pd."spotSlotId" = ss.id 
+															left join "Spot" s on ss."spotId" = s.id 
+															left join "SpotGroup" sg on s."spotGroupId" = sg.id 
+															),
+								spot_raw as (select ss2.id, "slotNumber", "spotId",
+															s."spotGroupId",
+															sg."spotGroupMediaId",
+															s."spotManageId",
+															s."spotType",
+															sg."regionDepth1",
+															sg."regionDepth2",
+															s."spotRegion",
+															sg.name
+															from "SpotSlot" ss2 
+															left join "Spot" s on ss2."spotId" = s.id 
+															left join "SpotGroup" sg on s."spotGroupId" = sg.id
+															),
+								real_last_raw as (select 
+													session_number,-- n 번째 세션인지 보여주는 컬럼 
+													rnk,
+													fr."spotSlotId", -- 스테이션 ID
+													spr."slotNumber",
+													spr."regionDepth1",
+													spr."regionDepth2",
+													spr."spotRegion",
+													spr."name",
+													"pmDeviceId", -- 어떤 PM인지 보여주는 ID
+													pcr."rxId",
+													pcr."pmId",
+													pcr."name" as pm_com_name,
+													date("historyStartAt" + interval '9 hour') as date_kr,
+													concat(date_part('year',("historyStartAt" + interval '9 hour')),'년') as year_start, -- 구글 스프레드 시트가 시간 더한걸이상하게 계산해서, 추가로 9시간 더해줬음 
+													concat(date_part('month', ("historyStartAt" + interval '9 hour')), '월') as month_start,
+													concat(date_part('day', ("historyStartAt" + interval '9 hour')), '일') as day_start,
+													("historyStartAt" + interval '9 hour') as Session_Start_at_kr, -- 도킹 시작 된 시간 (KST) = 세션 시작 시간  
+													/*case when ("otherStopAt" + interval '9 hour') is not null then ("otherStopAt" + interval '9 hour')
+														 when ("fullChargedAt" + interval '9 hour') is not null and ("otherStopAt" + interval '9 hour') is null then ("fullChargedAt" + interval '9 hour')
+														 when ("fullChargedAt" + interval '9 hour') is not null and ("otherStopAt" + interval '9 hour') is not null then ("otherStopAt" + interval '9 hour')
+														 when ("otherStopAt" + interval '9 hour') is null and ("fullChargedAt" + interval '9 hour') is null then ("historyEndAt" + interval '9 hour')
+														 end as Session_end_at_kr,-- 세션 종료 시간 (탈거 또는 Other Stop, Full Charge Stop 등 충전 종료 시간)*/
+													case
+														 when ("fullChargedAt" + interval '9 hour') is not null and ("otherStopAt" + interval '9 hour') is not null and ("fullChargedAt" + interval '9 hour')<=("otherStopAt" + interval '9 hour') then ("fullChargedAt" + interval '9 hour')
+														 when ("fullChargedAt" + interval '9 hour') is not null and ("otherStopAt" + interval '9 hour') is not null and ("fullChargedAt" + interval '9 hour')>=("otherStopAt" + interval '9 hour') then ("otherStopAt" + interval '9 hour')
+														 when ("fullChargedAt" + interval '9 hour') is not null and ("otherStopAt" + interval '9 hour') is null then ("fullChargedAt" + interval '9 hour') 
+														 when ("fullChargedAt" + interval '9 hour') is null and ("otherStopAt" + interval '9 hour') is not null then ("otherStopAt" + interval '9 hour') 
+														 when ("otherStopAt" + interval '9 hour') is null and ("fullChargedAt" + interval '9 hour') is null then ("historyEndAt" + interval '9 hour')
+														 end as Session_end_at_kr,-- 세션 종료 시간 (탈거 또는 Other Stop, Full Charge Stop 등 충전 종료 시간)
+													("historyEndAt" + interval '9 hour') as historyEndAt_kr, --일반적으로(앱 이용 또는 일반 PM기기 탈거) 도킹 해제 된 시간 (KST) 
+													("fullChargedAt" + interval '9 hour') as fullChargedAt_kr, -- 완충 된 시각 (KST)
+													("charged_at" + interval '9 hour') as charged_at_kr, -- 이전에 풀차지 되었을 때의 시간 (KST)
+													one_time_fee_charged as one_time_fee_charged,
+													("otherStopAt" + interval '9 hour') as otherStopAt_kr, -- 기타 오류 등으로 충전 종료 된 시각 (KST)
+													fr."errCode", -- 에러 시 에러 코드
+													--fr."errDescription", -- 에러 시 에러 상세 설명값 (서버 하드코딩본) 
+													case when fr."errCode" = '01' then 'Rx Stop' -- (배터리측 혹은 수신모듈(Rx)의 판단에 의한 충전 중단)
+														 when fr."errCode" = '02' then 'Tx Stop' -- (스테이션 이상동작 또는 스테이션 관제에 의한 충전 중단)
+														 when fr."errCode" = '03' then 'Battery Failure' -- (충전불가 배터리 판단에 따른 충전 중단)
+														 when fr."errCode" = '04' then 'FOD'  -- (기타 원인으로 인한 충전 중단)
+														 when fr."errCode" = '99' then '기타' -- (기타 오류)
+														 when fr."errCode" = 'string' then '정의되지 않은 오류' -- (미정의 오류)
+														 end as errDescription_redef, -- 에러 시 에러 상세 설명값 (새로 수정한 내용)
+													charging_time,
+													charging_mins,
+													charging_amount,
+													One_time_fee_amount,
+													charged_amount_total,
+													spr."spotManageId",
+													start_battery,
+													end_battery,
+													end_battery_session_end
+												from fee_raw fr							
+												left join pm_com_raw pcr on fr."pmDeviceId" = pcr.id
+												left join spot_raw spr on fr."spotSlotId" = spr.id
+												order by "pm_com_name", "year_start", "month_start", "historyStartAt"),
+									last_real_raw as (select *,
+											case when Session_end_at_kr = historyEndAt_kr then '세션종료_탈거'
+											 when Session_end_at_kr = fullChargedAt_kr then '세션종료_Full Charge Stop'
+											 when Session_end_at_kr = otherStopAt_kr then '세션종료_Other Stop'
+											 else null end as Session_end_reason,
+											 /*date_trunc('seconds', case when "historyendat_kr" is null then ("session_end_at_kr" - "session_start_at_kr")
+											 when "historyendat_kr" is not null then("historyendat_kr" - "session_start_at_kr")else null end) as charging_sec, --오리지널*/
+											 EXTRACT(DAY FROM (date_trunc('seconds', case when "historyendat_kr" is null then ("session_end_at_kr" - "session_start_at_kr")
+											 when "historyendat_kr" is not null then("historyendat_kr" - "session_start_at_kr")else null end))) *24*60*60
+										     + EXTRACT(HOUR FROM (date_trunc('seconds', case when "historyendat_kr" is null then ("session_end_at_kr" - "session_start_at_kr")
+											 when "historyendat_kr" is not null then("historyendat_kr" - "session_start_at_kr")else null end))) *60*60
+										     + EXTRACT(MINUTE FROM (date_trunc('seconds', case when "historyendat_kr" is null then ("session_end_at_kr" - "session_start_at_kr")
+											 when "historyendat_kr" is not null then("historyendat_kr" - "session_start_at_kr")else null end))) *60
+										     + EXTRACT(SECOND FROM (date_trunc('seconds', case when "historyendat_kr" is null then ("session_end_at_kr" - "session_start_at_kr")
+											 when "historyendat_kr" is not null then("historyendat_kr" - "session_start_at_kr")else null end))) AS scooter_geochi_time_sec, --스쿠터 dock on 이후 탈거 까지 총 거치된 시간 합 
+											 		case when "errCode" = '01' then '세션종료_충전 완료(만충 등)' -- (배터리측 혹은 수신모듈(Rx)의 판단에 의한 충전 중단)
+														 when "errCode" = '02' then '세션종료_기타' -- (스테이션 이상동작 또는 스테이션 관제에 의한 충전 중단)
+														 when "errCode" = '03' then '배터리 이슈' -- (충전불가 배터리 판단에 따른 충전 중단)
+														 when "errCode" = '04' then '세션종료_기타'  -- (기타 원인으로 인한 충전 중단)
+														 when "errCode" = '99' then '세션종료_기타' -- (기타 오류)
+														 when "errCode" = 'string' then '정의되지 않은 오류' -- (미정의 오류)
+														 	when Session_end_at_kr = historyEndAt_kr then '세션종료_탈거'
+											 				when Session_end_at_kr = fullChargedAt_kr then '세션종료_충전 완료(만충 등)'
+														 end as errDescription_redef_again -- 에러 시 에러 상세 설명값 (새로 수정한 내용),
+														 ,
+														 date_trunc('second',Session_end_at_kr-Session_start_at_kr) as charging_time_sec
+											from real_last_raw
+											where session_end_at_kr is not null
+											and name != '씽씽조립장소' --씽씽조립장소는 제외
+											and name != '강남 패스트파이브 4호점 6F'
+											and name != '강남패파6층'
+											and "pmId" != 'CESTEST07'
+											order by "session_start_at_kr", session_number, "regionDepth1", "regionDepth2", "spotRegion", "name"),
+												geochi_raw_last as (select distinct 
+												session_number,-- n 번째 세션인지 보여주는 컬럼 
+													rnk,
+													"spotSlotId", -- 스테이션 ID
+													"slotNumber",
+													"regionDepth1",
+													"regionDepth2",
+													case when "regionDepth2" like ('수원시%') then '수원시'
+												     when "regionDepth2" like ('영통구%') then '수원시'
+													 when "regionDepth2" like ('세종시%') then '세종시'
+													 when "regionDepth1" like ('울산%') then '울산시'
+													 when "regionDepth2" like ('용인시%') then '용인시'
+													 when "regionDepth2" like ('안산시%') then '안산시'
+													 when "regionDepth2" like ('전주시%') then '전주시' else "regionDepth2"  end as region_lol,
+													"name",
+													"pmDeviceId", -- 어떤 PM인지 보여주는 ID
+													"rxId",
+													"pmId",
+													pm_com_name,
+													date_kr,
+													year_start,
+													month_start,
+													day_start,
+													Session_Start_at_kr,
+													Session_end_at_kr,
+													historyendat_kr,
+													fullChargedAt_kr,
+													charged_at_kr,
+													one_time_fee_charged,
+													otherStopAt_kr,
+													"errCode",
+													errDescription_redef,
+													"charging_time",
+													charging_mins,
+													charging_amount,
+													One_time_fee_amount,
+													charged_amount_total,
+													"spotManageId",
+													Session_end_reason,
+													scooter_geochi_time_sec,
+													errDescription_redef_again,
+													charging_time_sec, --충전시간 초단위까지 
+													concat('`',"rxId") as rxId_adjusted,
+													start_battery,
+													end_battery_session_end,
+													end_battery,
+													-------------------거치 가동율 구하기 위해 추가한 것임 -------------------
+													date_kr as date_start,
+																case when "historyendat_kr" is null then date("session_end_at_kr")
+													 			when "historyendat_kr" is not null then date("historyendat_kr")else null end as date_end,
+													(to_char("session_start_at_kr", 'HH24:MI:SS')) as session_start_at_24time,
+													--EXTRACT(MINUTE from "session_start_at_kr") as session_start_min, -- 새션 시작 시간에서 분단위만 뽑아낸 것 
+													--EXTRACT(second from "session_start_at_kr") as session_start_sec, -- 세션 시작 시간에서 초단위만 뽑아낸 것 
+													EXTRACT(HOUR from "session_start_at_kr") as session_start_hour, -- 새션 시작 시간에서 시간 단위만 뽑아낸 것 
+													EXTRACT(HOUR from case when "historyendat_kr" is null then ("session_end_at_kr")
+													 			when "historyendat_kr" is not null then ("historyendat_kr")else null end) as session_end_hour, -- 세션 종료 시간에서 시간 단위만 뽑아낸 것 
+													(3600-((EXTRACT(MINUTE from "session_start_at_kr")*60)+(EXTRACT(second from "session_start_at_kr")))) as session_start_minsec,
+													--세션 시작한 시간 계산은 1시간(3600초)에서 세션 시작한 분,초를 초로 계산한 것을 빼줘서, 거치 시작한 시간부터 다음 정각까지 몇 초가 토탈 거치되었는지를 계산함 (session_end는 그냥 셈)
+													to_char(case when "historyendat_kr" is null then ("session_end_at_kr")
+													 			when "historyendat_kr" is not null then ("historyendat_kr")else null end,'HH24:MI:SS') as session_end_at_24time,
+													 --EXTRACT(MINUTE from (case when "historyendat_kr" is null then ("session_end_at_kr") when "historyendat_kr" is not null then ("historyendat_kr")else null end)) as session_end_min,
+													 			-- 세션 종료 시간에서 분단위만 뽑아낸 것 
+													 --EXTRACT(second from (case when "historyendat_kr" is null then ("session_end_at_kr") when "historyendat_kr" is not null then ("historyendat_kr")else null end)) as session_end_sec,
+													 			-- 세션 종료 시간에서 초단위만 뽑아낸 것 
+													 			(EXTRACT(MINUTE from (case when "historyendat_kr" is null then ("session_end_at_kr")
+													 			when "historyendat_kr" is not null then ("historyendat_kr")else null end))*60) +
+													 			 (EXTRACT(second from (case when "historyendat_kr" is null then ("session_end_at_kr")
+													 			when "historyendat_kr" is not null then ("historyendat_kr")else null end))) as session_end_minsec
+													 -------------------거치 가동율 구하기 위해 추가한 것임 -------------------
+												from last_real_raw
+												--where date_kr >= '2023-12-20'
+												--and "pmDeviceId" = '53' 
+												order by "session_start_at_kr", session_number, "regionDepth1", "regionDepth2", "region_lol", "name")
+														select
+														session_number,-- n 번째 세션인지 보여주는 컬럼 
+														rnk,
+														"spotSlotId", -- 스테이션 ID
+														"slotNumber",
+														"regionDepth1",
+														"regionDepth2",
+														"region_lol",
+														"name",
+														"pmDeviceId", -- 어떤 PM인지 보여주는 ID
+														"rxId",
+														"pmId",
+														pm_com_name,
+														date_kr,
+														year_start,
+														month_start,
+														day_start,
+														Session_Start_at_kr,
+														Session_end_at_kr,
+														historyendat_kr,
+														fullChargedAt_kr,
+														charged_at_kr,
+														one_time_fee_charged,
+														otherStopAt_kr,
+														"errCode",
+														errDescription_redef,
+														"charging_time",
+														charging_mins,
+														charging_amount,
+														One_time_fee_amount,
+														charged_amount_total,
+														"spotManageId",
+														Session_end_reason,
+														scooter_geochi_time_sec,
+														errDescription_redef_again,
+														charging_time_sec, --충전시간 초단위까지 
+														concat('`',"rxId") as rxId_adjusted,
+														start_battery,
+														end_battery_session_end,
+														end_battery,
+														date_start,
+														date_end,
+														session_start_at_24time,
+														case when date_start = date_end and session_start_hour = session_end_hour then scooter_geochi_time_sec else session_start_minsec end as session_start_hour_new,
+														--session_start_hour,
+														session_end_at_24time,
+														case when date_start = date_end and session_start_hour = session_end_hour then 0 else session_end_minsec end as session_end_hour_new,
+														--session_end_hour,
+														scooter_geochi_time_sec,
+														case when (date_end - date_start) = 0 then 9999
+														when (date_end - date_start) >= 1 then ((date_end - date_start)-1) end as date_count --- 하루 24시간을 풀로 더해줘야 하는 값
+														from geochi_raw_last grl
+														where date_kr >= '2023-12-20'
+														--where session_number not in ('9663','11030') -- 씽씽 기기 charging stop이 안들어와서 과다하게 계싼된 건 수동으로 제외 처리 _230207
+														--where "pmDeviceId" = 588
+														--where session_number not in ('957','940','993')
+																												
